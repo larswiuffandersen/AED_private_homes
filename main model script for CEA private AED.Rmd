@@ -1,0 +1,1190 @@
+---
+Title: "Model script for private automated external defibrillator (AED)"
+Author: "Model developers: Lisa Caulley & Eline Krijkamp"
+Date: "2024-11-22 - last check 2025-04-17"
+Output: html_document
+---
+
+#00 Aim of this project
+This decision model investigates the effectiveness and cost-effectiveness of AEDs in private homes. 
+Implements a time-independent cohort state-transition model (cSTM)  
+- *home AED (AED)*:      Intervention where patients with cardiac arrest have a AED at home.
+- *no home AED (noAED)*: Intervention where patients with cardiac arrest do not have a AED at home.
+
+#00 Main model assumptions 
+- Data is used from an observational study using prospectively collected data from the CARES registry in the United States.
+- It is assumed that there is no causal effect of AED application in those with a non-shockable rhythm. Therefore, a “difference-in-difference” approach was used to estimate the causal effect of AED application in those with a shockable rhythm.
+- Willingness-to-pay is set to 200,000 US dollar / QALY gained
+- Half-cycle correction is applied
+- The transition probabilities for both the AED and no AED arm are similar throughout the simulation. The difference is in the initial state distribution among the CPC groups at the start of the simulation. 
+
+\newpage
+
+# 00 Knitting setup
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Change `eval` to `TRUE` if you want to knit this document.
+
+```{r}
+# Set global knitr options for all code chunks in this document. The 'echo = TRUE' 
+# option ensures that the R code is displayed in the output alongside the results, 
+# making it easier for readers to follow the analysis.
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# 01 Load packages
+```{r, eval = TRUE, echo = FALSE, warning = FALSE, message = FALSE}
+
+# Check if the 'pacman' package is installed. If not, install and load it.
+# 'pacman' is used for managing R package dependencies in a more streamlined manner.
+if (!require('pacman')){
+  install.packages('pacman')
+  library(pacman) # use this package to conveniently install other packages
+}
+
+# Use pacman to load (and install if not already installed) a set of packages.
+# These packages are essential for data manipulation, plotting, and various 
+# other functions used in this project.
+pacman::p_load("dplyr", "data.table", "devtools", "scales", "ellipse", "ggplot2", 
+               "lazyeval", "igraph", "truncnorm", "ggraph", "reshape2", "knitr", 
+               "stringr", "gridExtra", "diagram", "boot", "mc2d", "assertHE", 
+               "triangle", "here", "patchwork", "assertHE", "plotly")  
+
+
+# The following lines are for installing specific versions of packages directly 
+# from GitHub repositories. They are commented out by default. Uncomment if needed.
+# These may provide newer versions or specific builds not available on CRAN.
+#install_github("DARTH-git/dampack", force = TRUE)
+#install_github("DARTH-git/darthpack", force = TRUE)
+#install_github("DARTH-git/darthtools", force = TRUE)
+# devtools::install_github("collectivemedia/tictoc") # install to measure the time
+
+# Use pacman to load packages from GitHub. These packages are part of the DARTH workgroup,
+# providing frameworks and tools for cost-effectiveness analysis and health economic 
+# modeling in R.
+p_load_gh("DARTH-git/dampack") # coding framework to construct model-based cost-effectiveness analysis in R
+p_load_gh("DARTH-git/darthpack") # package for analyzing and visualizing the health economic outputs of mathematical models
+p_load_gh("DARTH-git/darthtools") # a R package that contains tools frequently used by the DARTH workgroup
+
+```
+
+
+# 02 Load functions
+This section is used to load some general and model specific function. Those functions are stored in the functions folder.
+```{r, eval = TRUE, echo = FALSE, warning = FALSE, message = FALSE}
+#Load functions for importing data and sensitivity analyses
+source("./R/01_model_input_functions.R")              # functions importing data
+source("./R/02_decision_model_function.R")            # functions importing the model function
+source("./R/05a_probabilistic_analysis_functions.R")  # functions for the PSA
+```
+
+# 03 Input parameters 
+## 03.1 External 
+The model input parameters are save in an excel file. called "parameters". 
+This file is stored in the data folder. 
+The data is loaded after which we focus on the main input parameters for the base-case analysis.
+Therefore, we only take the mean estimate. 
+In the section for the sensitivity analysis, this dataset is used to also consider the parameter distributions. 
+```{r, echo = FALSE}
+#### Load data ####
+# Load the parameters from an Excel file into a data frame.
+# 'readxl::read_xlsx' is used to read the specific sheet named 'input' from the Excel file.
+df_param_full <- data.frame(readxl::read_xlsx("./data/parameters.xlsx", 
+                                            sheet = "input")) 
+# New model parameters should be added to this sheet. 
+# The structure of the data is presented in the excel file.
+
+
+### Remove parameters without unit ###
+# Clean the data frame by removing parameters that do not have a unit.
+# The 'remove_param_without_unit' function is a function (saved in the figures folder)
+# that filters out rows where the 'unit' or "med" column is empty or not defined.
+df_param_clean <- remove_param_without_unit(df_param = df_param_full)
+
+# Create a subset of the cleaned data frame, selecting only the 'Param' and 'Med' columns.
+# This subset includes the base-case parameters for further analysis.
+df_param       <- df_param_clean %>% select(Param, Med) 
+
+# Convert the 'Med' column of the subset data frame into a list. 
+# This list will contain the median values (or base-case values) of the parameters.
+l_param        <- as.list(df_param$Med)
+# Name the elements of the list with the corresponding parameter names from the 'Param' column.
+names(l_param) <- df_param$Param 
+
+# Add the list items to the global environment 
+
+ls() # Display the current objects in the global environment.
+l_param # Print the created list 'l_param' to view its contents.
+list2env(l_param, globalenv()) # Use 'list2env' to assign each element of the 
+# list 'l_param' as an individual object  in the global environment. This makes 
+# each parameter directly accessible as a variable.
+
+```
+
+## 03.2 Internal general model settings and input
+
+### 03.2.1 Hard-coded values
+```{r}
+# Create strategies
+v_names_str <- c("AED", "noAED")       # Create and name strategies to be tested
+
+# Markov model parameters
+v_names_states <- c("CPC1", "CPC2", "CPC3", "CPC4", "D")  # Create the states of the model: Cardiac arrest, functional neurological status 1 through 4, death
+
+# Set Willingness-to-pay threshold
+wtp   <- 200000  # Willingness-to-pay threshold of 200000
+
+```
+
+### 03.2.2 Naming parameters
+```{r}
+n_states       <- length(v_names_states)        # Number of health states 
+v_names_cycles <- paste("cycle", 0:n_cycles)    # Add cycle names
+n_str          <- length(v_names_str)           # Number of strategies
+
+# Discount rate per cycle 
+d_e <- d_c # Discount of costs and QALYs by 3%
+
+# Discount weights for costs and effects
+v_dwc <- 1 / (1 + d_c) ^ (c(0:(n_cycles))) 
+v_dwe <- 1 / (1 + d_e) ^ (c(0:(n_cycles)))  
+
+
+# Within-cycle correction (WCC) using half-cycle correction
+v_wcc <- darthtools::gen_wcc(n_cycles = n_cycles, 
+                                method = "half-cycle") # vector of wcc
+# to remove cycle correction, state method = "none"
+
+```
+
+
+## 0.3.2.2 Intermediate calculations of input parameters 
+```{r}
+# Probability of shockable rhythm with AED 
+# The dataset gave a risk-ratio - therefore, the effect measure can be directly applied to the probability
+p_shockable_AED        <- rr_AED_group_shockable * p_shockable_noAED # Convert the probability of shockable rhythm without AED to shockable rhythm with AED 
+
+# Probability to survive a shockable cardiac arrest with AED
+p_survive_shockable_AED  <- rr_survive_AED_group_shockable * p_survive_shockable_noAED   # Convert the probability to survive without AED to probability of death with AED
+
+# Calculate the probability to survive after nonshockable cardiac arrest with AED use, based on initial rhythm.
+p_survive_nonshockable_AED <- rr_survive_AED_group_nonshockable * p_survive_nonshockable_noAED # Convert the probability to survive without AED to probability of death with AED
+
+# Calculate probabilities for death from probabilities to survive
+p_arrest_D_shockable_AED      <- 1 - p_survive_shockable_AED      # probability to die after shockable arrest with AED
+p_arrest_D_shockable_noAED    <- 1 - p_survive_shockable_noAED    # probability to die after shockable arrest without AED
+p_arrest_D_nonshockable_AED   <- 1 - p_survive_nonshockable_AED   # probability to die after nonshockable arrest with AED
+p_arrest_D_nonshockable_noAED <- 1 - p_survive_nonshockable_noAED # probability to die after nonshockable arrest without AED
+
+# Create a variable to store probabilities for chance nodes with multiple branches
+# Probabilities by outcome (CPC)
+p_CPC_shockable_AED   <- (p_CPC1_shockable_AED   + p_CPC2_shockable_AED   + p_CPC3_shockable_AED   + p_CPC4_shockable_AED)
+p_CPC_shockable_noAED <- (p_CPC1_shockable_noAED + p_CPC2_shockable_noAED + p_CPC3_shockable_noAED + p_CPC4_shockable_noAED)
+p_CPC_nonshockable    <- (p_CPC1_nonshockable    + p_CPC2_nonshockable    + p_CPC3_nonshockable    + p_CPC4_nonshockable) 
+
+# Calculate probability of shockable rhythm by AED use
+p_nonshockable_AED   <- 1 - p_shockable_AED   # the probability of having a nonshockable event in the AED arm
+p_nonshockable_noAED <- 1 - p_shockable_noAED # the probability of having a nonshockable event in the no AED arm
+
+# Calculate probability AED not used
+p_AED_not_used <- 1- p_AED_used
+
+# Create a vector of probability of death after first year by CPC
+v_CPC1_D <- c(p_CPC1_D_Y1 * p_multiplier, rep(p_CPC1_D * p_multiplier, each = n_cycles - 1))
+
+v_CPC2_D <- c(p_CPC2_D_Y1 * p_multiplier, rep(p_CPC2_D * p_multiplier, each = n_cycles - 1))
+
+v_CPC3_D <- c(p_CPC3_D_Y1 * p_multiplier, rep(p_CPC3_D * p_multiplier, each = n_cycles - 1))
+
+v_CPC4_D <- c(p_CPC4_D_Y1 * p_multiplier, rep(p_CPC4_D * p_multiplier, each = n_cycles - 1))
+
+
+# Create decision tree of initial distribution by health states 
+# AED strategy
+
+#@EK:@LC: this code is correct, and in line with the overview in Amua and the image. However, multiplication and summing in R can be done faster with matrix multiplication.
+# In that case we have to crease vectors of the probabilities and multiply those. 
+v_m_init_AED <- c("CPC1" = p_AED_used     * p_shockable_AED      * p_survive_shockable_AED      * p_CPC1_shockable_AED /   p_CPC_shockable_AED +   # AED used, shockable, survive, CPC1
+                           p_AED_used     * p_nonshockable_AED   * p_survive_nonshockable_AED   * p_CPC1_nonshockable /    p_CPC_nonshockable +    # AED used, nonshockable, survive, CPC1
+                           p_AED_not_used * p_shockable_noAED    * p_survive_shockable_noAED    * p_CPC1_shockable_noAED / p_CPC_shockable_noAED + # AED not used, shockable, survive, CPC1
+                           p_AED_not_used * p_nonshockable_noAED * p_survive_nonshockable_noAED * p_CPC1_nonshockable /    p_CPC_nonshockable,     # AED not used, non shockable, survive, CPC1 
+                  
+                  "CPC2" = p_AED_used     * p_shockable_AED      * p_survive_shockable_AED      * p_CPC2_shockable_AED/   p_CPC_shockable_AED +    # AED used, shockable, survive, CPC2
+                           p_AED_used     * p_nonshockable_AED   * p_survive_nonshockable_AED   * p_CPC2_nonshockable/    p_CPC_nonshockable +     # AED used, nonshockable, survive, CPC2
+                           p_AED_not_used * p_shockable_noAED    * p_survive_shockable_noAED    * p_CPC2_shockable_noAED/ p_CPC_shockable_noAED +  # AED not used, shockable, survive, CPC2
+                           p_AED_not_used * p_nonshockable_noAED * p_survive_nonshockable_noAED * p_CPC2_nonshockable/    p_CPC_nonshockable,      # AED not used, non shockable, survive, CPC2
+                  
+                  "CPC3" = p_AED_used     * p_shockable_AED      * p_survive_shockable_AED      * p_CPC3_shockable_AED/   p_CPC_shockable_AED +    # AED used, shockable, survive, CPC3
+                           p_AED_used     * p_nonshockable_AED   * p_survive_nonshockable_AED   * p_CPC3_nonshockable/    p_CPC_nonshockable +     # AED used, nonshockable, survive, CPC3
+                           p_AED_not_used * p_shockable_noAED    * p_survive_shockable_noAED    * p_CPC3_shockable_noAED/ p_CPC_shockable_noAED +  # AED not used, shockable, survive, CPC3
+                           p_AED_not_used * p_nonshockable_noAED * p_survive_nonshockable_noAED * p_CPC3_nonshockable/    p_CPC_nonshockable,      # AED not used, non shockable, survive, CPC3, 
+                  
+                  "CPC4" = p_AED_used     * p_shockable_AED      * p_survive_shockable_AED      * p_CPC4_shockable_AED/   p_CPC_shockable_AED +    # AED used, shockable, survive, CPC4
+                           p_AED_used     * p_nonshockable_AED   * p_survive_nonshockable_AED   * p_CPC4_nonshockable/    p_CPC_nonshockable +     # AED used, nonshockable, survive, CPC4
+                           p_AED_not_used * p_shockable_noAED    * p_survive_shockable_noAED    * p_CPC4_shockable_noAED/ p_CPC_shockable_noAED +  # AED not used, shockable, survive, CPC4
+                           p_AED_not_used * p_nonshockable_noAED * p_survive_nonshockable_noAED * p_CPC4_nonshockable/    p_CPC_nonshockable,      # AED not used, non shockable, survive, CPC4
+                
+                  "D"    = p_AED_used     * p_shockable_AED      * p_arrest_D_shockable_AED +     # AED used, shockable, die
+                           p_AED_used     * p_nonshockable_AED   * p_arrest_D_nonshockable_AED +  # AED used, nonshockable, die
+                           p_AED_not_used * p_shockable_noAED    * p_arrest_D_shockable_noAED +   # AED not used, shockable, die
+                           p_AED_not_used * p_nonshockable_noAED * p_arrest_D_nonshockable_noAED) # AED not used, non shockable, die  
+
+
+#No AED strategy
+v_m_init_noAED <- c("CPC1" = p_shockable_noAED * p_survive_shockable_noAED    * p_CPC1_shockable_noAED/p_CPC_shockable_noAED +  # shockable, survive, CPC1
+                          p_nonshockable_noAED * p_survive_nonshockable_noAED * p_CPC1_nonshockable/p_CPC_nonshockable,         # non shockable, survive, CPC1            
+  
+                    "CPC2" = p_shockable_noAED * p_survive_shockable_noAED    * p_CPC2_shockable_noAED/p_CPC_shockable_noAED +  # shockable, survive, CPC2
+                          p_nonshockable_noAED * p_survive_nonshockable_noAED * p_CPC2_nonshockable/p_CPC_nonshockable,         # non shockable, survive, CPC2
+                  
+                    "CPC3" = p_shockable_noAED * p_survive_shockable_noAED    * p_CPC3_shockable_noAED/p_CPC_shockable_noAED +  # shockable, survive, CPC3
+                          p_nonshockable_noAED * p_survive_nonshockable_noAED * p_CPC3_nonshockable/p_CPC_nonshockable,         # non shockable, survive, CPC3  
+              
+                    "CPC4" = p_shockable_noAED * p_survive_shockable_noAED    * p_CPC4_shockable_noAED/p_CPC_shockable_noAED +  # shockable, survive, CPC4
+                          p_nonshockable_noAED * p_survive_nonshockable_noAED * p_CPC4_nonshockable/p_CPC_nonshockable,         # non shockable, survive, CPC4
+                  
+                    "D"   =  p_shockable_noAED * p_arrest_D_shockable_noAED +                                                   # shockable, survive, CPC1
+                          p_nonshockable_noAED * p_arrest_D_nonshockable_noAED)                                                 # non shockable, survive, CPC1
+
+
+```
+
+
+## 03.3 Create a state-transition diagram of the cohort model
+
+```{r}
+m_P_diag <- matrix(0, nrow = n_states, ncol = n_states, dimnames = list(v_names_states, v_names_states))
+m_P_diag["CPC1"   , "CPC1" ] = "" 
+m_P_diag["CPC1"   , "D"    ] = ""
+
+m_P_diag["CPC2"   , "CPC2" ] = ""
+m_P_diag["CPC2"   , "D"    ] = ""
+
+m_P_diag["CPC3"   , "CPC3" ] = ""
+m_P_diag["CPC3"   , "D"    ] = ""
+
+m_P_diag["CPC4"   , "CPC4" ] = "" 
+m_P_diag["CPC4"   , "D"    ] = "" 
+
+m_P_diag["D"      , "D"    ] = "" 
+
+# Define a layout for the matrix plot.
+layout.fig <- c(2, 2, 1)
+
+# Plot the transition matrix using the 'plotmat' function from the 'diagram' package.
+# The matrix is transposed (t(m_P_diag)) for visualization purposes.
+# The function includes various graphical parameters to control the appearance of the plot.
+plotmat(t(m_P_diag), t(layout.fig), self.cex = 0.4, curve = 0, arr.pos = 0.1,   
+        latex = T, arr.type = "curved", relsize = 0.8, box.prop = 0.5, 
+        cex = 0.8, box.cex = 0.8, lwd = 1)
+
+```
+
+
+# 04 Define and initialize matrices and vectors
+
+## 04.1 Markov cohort trace matrix
+```{r}
+# create the markov trace matrix M capturing the proportion of the cohort in each state 
+# at each cycle
+m_M_noAED <- m_M_AED <- matrix(NA, 
+                                nrow     = n_cycles + 1, ncol = n_states,
+                                dimnames = list(paste("cycle", 0:n_cycles, sep = " "), v_names_states))
+
+head(m_M_noAED) # show first 6 rows of the matrix 
+
+# The cohort starts after the arrest in the first CPC health state
+m_M_AED[1, ]   <- v_m_init_AED   # initiate first cycle of cohort trace 
+m_M_noAED[1, ] <- v_m_init_noAED # initiate first cycle of cohort trace 
+
+head(m_M_AED)
+head(m_M_noAED)
+```
+
+## 04.1.1 Transition arrays 
+
+```{r}
+## Initialize transition array which will capture transitions from each state to another over time
+
+# for AED
+a_A_AED <- array(0,
+             dim      = c(n_states, n_states, n_cycles + 1),
+             dimnames = list(v_names_states, v_names_states, 0:n_cycles))
+
+
+# Initialize transition array for strategies no AED
+a_A_noAED <- a_A_AED
+
+# Set first slice of transition array for each strategy with the initial state vector in its diagonal
+diag(a_A_AED[, , 1])   <- v_m_init_AED
+diag(a_A_noAED[, , 1]) <- v_m_init_noAED
+
+
+```
+
+
+## 04.2 Transition probability array
+
+```{r}
+# create the transition probability array for AED strategy
+# All transitions to a non-death state are assumed to be conditional on survival
+a_P_AED <- array(0,  # Create 3-D array
+                dim = c(n_states, n_states, n_cycles),
+                dimnames = list(v_names_states, v_names_states, 
+                                v_names_cycles[-length(v_names_cycles)])) # name the dimensions of the array 
+
+
+```
+
+
+## 04.3 Fill in transition probability array: AED
+
+```{r}
+# From CPC1
+a_P_AED["CPC1", "CPC1", ] <- 1 - v_CPC1_D         # CPC1 to CPC1
+a_P_AED["CPC1", "D", ]    <-     v_CPC1_D         # CPC1 to death
+
+# From CPC2
+a_P_AED["CPC2", "CPC2", ] <- 1 - v_CPC2_D         # CPC2 to CPC2
+a_P_AED["CPC2", "D", ]    <-     v_CPC2_D         # CPC2 to death
+
+# From CPC3
+a_P_AED["CPC3", "CPC3", ] <- 1 - v_CPC3_D         # CPC3 to CPC3
+a_P_AED["CPC3", "D", ]    <-     v_CPC3_D         # CPC3 to death
+
+# From CPC4
+a_P_AED["CPC4", "CPC4", ] <- 1 - v_CPC4_D         # CPC4 to CPC4
+a_P_AED["CPC4", "D", ]    <-     v_CPC4_D         # CPC4 to death
+
+# From Dead
+a_P_AED["D", "D", ] <-1                           # Death to death
+
+
+
+```
+
+
+## 04.3 Fill in transition probability array: No AED
+Assumption: The transition probabilities for both the AEH and no AED arm are similar throughout the simulation. The difference is in the initial state distribution among the CPC groups at the start of the simulation. 
+```{r}
+# Store the probability matrix of AED in the no AED arm 
+a_P_noAED <- a_P_AED
+
+```
+
+
+### 04.3.1 Check if transition probability matrices are valid
+In this section we check the transition probability values. Are all values between 0 and 1. And we check if all the rows sum up 1. 
+```{r}
+## Check that transition probabilities are valid [0, 1]
+check_transition_probability(a_P_AED,    verbose = TRUE)
+check_transition_probability(a_P_noAED,  verbose = TRUE)
+
+## Check that all rows sum to 1
+check_sum_of_transition_array(a_P_AED,    n_states = n_states, n_cycles = n_cycles, verbose = TRUE)
+check_sum_of_transition_array(a_P_noAED,  n_states = n_states, n_cycles = n_cycles, verbose = TRUE)
+```
+
+
+# 05 Markov model
+## 05.1 Run Markov model
+For all the cycles, we run the model. We use both, matrix multiplication and element-wise multiplication. The matrix multiplicaiton gives us the Markov trace directly.
+For the element-wise multiplication, we can get the transitions at each cycle. This is useful for transition rewards. 
+```{r}
+
+for (t in 1:n_cycles){     # loop through the number of cycles
+  ## Fill in cohort trace for the next cycle (t + 1)
+  
+  # For the AED strategy
+  m_M_AED[t + 1,   ] <- m_M_AED[t, ]  %*% a_P_AED[, , t]    
+  # For the no AED strategy
+  m_M_noAED[t + 1, ] <- m_M_noAED[t, ] %*% a_P_noAED[, , t]    
+  
+  # For the AED strategy
+  a_A_AED[, , t + 1]    <- m_M_AED[t, ]   *  a_P_AED[, , t]
+  # For the no AED strategy
+  a_A_noAED[, , t + 1]  <- m_M_noAED[t, ] *  a_P_noAED[, , t]                                             
+  
+  ## Store the cohort traces in a list
+  l_m_M        <- list(m_M_AED,
+                       m_M_noAED)
+  names(l_m_M) <- v_names_str         #Add strategy names
+  
+  
+  ## Store the cohort traces in a list
+  l_a_A        <- list(a_A_AED,
+                       a_A_noAED)
+  names(l_a_A) <- v_names_str        #Add strategy names
+                                              
+} # close the loop
+
+
+head(m_M_AED)    # show the first 6 lines of the matrix
+head(m_M_noAED)  # show the first 6 lines of the matrix
+
+
+```
+
+
+# 06 Compute and Plot Epidemiological Outcomes
+
+##06.1 Cohort traces
+
+```{r, fig.cap = 'Cohort trace of the cSTM under both strategy', message = FALSE, warning = FALSE, fig.pos = "H", }
+# Create a plot of the data
+ plot_trace(l_m_M$noAED) + 
+  ggtitle("Cohort trace no AED")      # Add title to plot
+
+# Option to save figures in the figures folder
+ggsave("./figures/cohort_trace_noAED.pdf")
+
+# Create a plot of the data
+plot_trace(l_m_M$AED) +
+   ggtitle("Cohort trace AED")      # Add title to plot
+
+# Option to save figures in the figures folder
+ggsave("./figures/cohort_trace_AED.pdf")
+```
+##06.1.2 Cohort traces combined in pannel 
+```{r}
+# Full plots
+p1_full <- plot_trace(l_m_M$noAED) + 
+  ggtitle("Cohort trace no AED (Full view)")
+
+p2_full <- plot_trace(l_m_M$AED) +
+  ggtitle("Cohort trace AED (Full view)")
+
+# Zoomed-in plots (adjust the y-axis limits)
+p1_zoom <- plot_trace(l_m_M$noAED) + 
+  ggtitle("Cohort trace no AED (Zoomed in)") +
+  coord_cartesian(ylim = c(0, 0.1))  # only show 80%-100%
+
+p2_zoom <- plot_trace(l_m_M$AED) +
+  ggtitle("Cohort trace AED (Zoomed in)") +
+  coord_cartesian(ylim = c(0, 0.1))  # adjust as needed
+
+# Combine in a 2x2 grid
+# Combine and collect the legend
+combined_panel <- (p1_full | p2_full) /
+                  (p1_zoom | p2_zoom) +
+                  plot_layout(guides = "collect")  # <- this line collects one legend
+
+# Optionally align legends at bottom or right
+combined_panel <- combined_panel & theme(legend.position = "bottom")
+
+# Show the combined panel
+combined_panel
+
+# Save the figure
+ggsave("./figures/cohort_trace_panel.pdf", combined_panel, width = 14, height = 10)
+
+
+```
+
+
+```{r , fig.cap = 'Cohort trace by state of cSTM under all strategies', message = FALSE, warning = FALSE, fig.pos = "H"}
+
+# Create a plot of all traces
+plot_trace_fig <- plot_trace_strategy(l_m_M) +
+  scale_color_hue() 
+
+# Display figure
+plot_trace_fig
+
+# Option to save figures in the figures folder
+ggsave("./figures/stratgies.pdf")
+
+```
+
+
+## 06.2 Overall Survival (OS)
+
+```{r , fig.cap = 'Overall survival', message = FALSE, warning = FALSE, fig.pos = "H"}
+
+# Create a plot of survival curves
+survival_plot <- plot_surv(l_m_M, v_names_death_states = "D") + 
+  theme(legend.position = "bottom")+
+  scale_x_continuous(breaks=seq(0, n_cycles, 2))+
+  scale_color_hue() +
+  ggtitle("Survival probability (NOTE: extremly zoomed-in. Values very low")
+# Display figure
+survival_plot
+
+# Option to save figures in the figures folder
+ggsave("./figures/survivalplot.pdf")
+
+# calculate the overall survival (OS) probability per strategy
+v_os_AED   <- 1 - m_M_AED[, "D"]    
+v_os_noAED <- 1 - m_M_noAED[, "D"]   
+
+# create a vector with the life expectancy per strategy
+v_LE        <- round(c(sum(v_os_AED), sum(v_os_noAED)), 3)
+names(v_LE) <- v_names_str # name the vector
+v_LE
+
+#Export data to create external graph
+write.csv(x = l_m_M, file = "./output/survival_all_cycles.csv")
+
+```
+
+
+## 06.3 Disease prevalence
+
+```{r Sick-Sicker-DisPrev-SimTimDep, fig.cap='CPC prevalence', message = FALSE, warning = FALSE, fig.pos="H"}
+
+# Display disease prevalence per health state and strategy
+
+prevalence_CPC1_plot <- plot_prevalence(l_m_M, 
+                                      v_names_sick_states = c("CPC1"), 
+                                      v_names_dead_states = "D")  +
+                                      theme(legend.position = "bottom") +
+                                      scale_color_hue()
+# Option to save figures in the figures folder
+ggsave("./figures/prevalence_CPC1_plot.pdf")
+
+prevalence_CPC2_plot <- plot_prevalence(l_m_M, 
+                                      v_names_sick_states = c("CPC2"), 
+                                      v_names_dead_states = "D")  +
+                                      theme(legend.position = "bottom") +
+                                      scale_color_hue()
+# Option to save figures in the figures folder
+ggsave("./figures/prevalence_CPC2_plot.pdf")
+
+prevalence_CPC3_plot <- plot_prevalence(l_m_M, 
+                                      v_names_sick_states = c("CPC3"), 
+                                      v_names_dead_states = "D")  +
+                                      theme(legend.position = "bottom") +
+                                      scale_color_hue()
+# Option to save figures in the figures folder
+ggsave("./figures/prevalence_CPC3_plot.pdf")
+
+prevalence_CPC4_plot <- plot_prevalence(l_m_M, 
+                                      v_names_sick_states = c("CPC4"), 
+                                      v_names_dead_states = "D")  +
+                                      theme(legend.position = "bottom") +
+                                      scale_color_hue()
+# Option to save figures in the figures folder
+ggsave("./figures/prevalence_CPC4_plot.pdf")
+
+# Display all figures in one plot
+# Combine in a 2x2 grid
+# Combine and collect the legend
+prevalence_combined_panel <- (prevalence_CPC1_plot | prevalence_CPC2_plot) /
+                  (prevalence_CPC3_plot | prevalence_CPC4_plot) +
+                  plot_layout(guides = "collect")  # <- this line collects one legend
+
+# Optionally align legends at bottom or right
+prevalence_combined_panel <- prevalence_combined_panel & theme(legend.position = "bottom")
+
+
+# Option to save figures in the figures folder
+ggsave("./figures/prevalence_combined_plot.pdf")
+```
+
+
+# 07 Compute Cost-Effectiveness Outcomes
+
+##07.1 Calculate AED costs 
+This code calculates the expected AED cost per cardiac arrest in a household by dividing the total cost of the AED and training by the probability that at least one household member experiences a cardiac arrest. It adjusts the cost based on the size of the household and individual risk.
+```{r}
+# Calculate AED cost per cardiac arrest
+# first part equation: cost of buying a AED device and the total cost of training all members of the household
+# denominator: estimates the probability that at least one cardiac arrest occurs in the household
+# (1 - p_cardiac_arrest) = probability. that a person does NOT have a cardiac arrest
+# (1 - p_cardiac_arrest) ^ size_household = probability that NOBODY in the household has a cardiac arrest (assumption: cardiac arrest happen independently) (1 - p)^n
+# 1 - gives the probability that at least one person had a cardiac arrest 
+c_AED_Arrest <- (c_AED + c_AED_training * size_household) / (1 - ((1 - p_cardiac_arrest) ^ size_household))
+
+
+```
+
+## 07.2 Create cost array
+
+```{r}
+# create the cost array for AED strategy
+a_C_AED <- array(0,  # Create 3-D array
+                dim = c(n_states, n_states, n_cycles),
+                dimnames = list(v_names_states, v_names_states, 
+                                v_names_cycles[-length(v_names_cycles)])) # name the dimensions of the array 
+
+a_C_noAED <- a_C_AED
+```
+
+## 07.3 Fill the costs array and create QALYs vectors
+
+```{r}
+# AED Costs
+# Common base cost
+c_base <- c_AED_Arrest + c_emergency_department
+
+# AED Costs per CPC level (Year 1)
+#@LC: are we using the c_multiplier here corect. See differnet with the no AED group
+c_AED_CPC1_Y1 <- c_base + (c_hospital_CPC1 + c_medical_CPC1) * c_multiplier
+c_AED_CPC2_Y1 <- c_base + (c_hospital_CPC2 + c_medical_CPC2) * c_multiplier
+c_AED_CPC3_Y1 <- c_base + (c_hospital_CPC3 + c_medical_CPC3) * c_multiplier
+c_AED_CPC4_Y1 <- c_base + (c_hospital_CPC4 + c_medical_CPC4) * c_multiplier
+
+c_AED_D_Y1    <-  c_AED_Arrest + 
+                  (p_AED_used * p_shockable_AED * p_arrest_D_shockable_AED * (c_emergency_department * c_multiplier * (p_die_emergency_department_shockable_AED + 
+                                                                                                                         p_die_hospital_shockable_AED) + c_hospital_D * c_multiplier * p_die_hospital_shockable_AED)) + (p_AED_used * p_nonshockable_AED * p_arrest_D_nonshockable_AED * (c_emergency_department * c_multiplier * (p_die_emergency_department_nonshockable + p_die_hospital_nonshockable) + c_hospital_D * c_multiplier * p_die_hospital_nonshockable)) + (p_AED_not_used * p_shockable_noAED * p_arrest_D_shockable_noAED * (c_emergency_department * c_multiplier * (p_die_emergency_department_shockable_noAED + p_die_hospital_shockable_noAED) + c_hospital_D * c_multiplier * p_die_hospital_shockable_noAED)) + (p_AED_not_used * p_nonshockable_noAED * p_arrest_D_nonshockable_noAED * (c_emergency_department * c_multiplier * (p_die_emergency_department_nonshockable + p_die_hospital_nonshockable) + c_hospital_D * c_multiplier * p_die_hospital_nonshockable))
+
+#No AED Costs
+c_noAED_CPC1_Y1 <- (c_emergency_department + c_hospital_CPC1 + c_medical_CPC1) * c_multiplier
+c_noAED_CPC2_Y1 <- (c_emergency_department + c_hospital_CPC2 + c_medical_CPC2) * c_multiplier
+c_noAED_CPC3_Y1 <- (c_emergency_department + c_hospital_CPC3 + c_medical_CPC3) * c_multiplier 
+c_noAED_CPC4_Y1 <- (c_emergency_department + c_hospital_CPC4 + c_medical_CPC4) * c_multiplier 
+
+c_noAED_D_Y1    <- (p_shockable_noAED    * p_arrest_D_shockable_noAED  * 
+                    (c_emergency_department * c_multiplier * (p_die_emergency_department_shockable_noAED + p_die_hospital_shockable_noAED) + c_hospital_D * c_multiplier * p_die_hospital_shockable_noAED)
+                    ) + 
+                   (p_nonshockable_noAED * p_arrest_D_nonshockable_noAED * 
+                    (c_emergency_department * c_multiplier * (p_die_emergency_department_nonshockable    + p_die_hospital_nonshockable) + c_hospital_D * c_multiplier * p_die_hospital_nonshockable)
+                    )
+
+#Costs for subsequent years
+c_annual <- c_medical_yearly * c_multiplier
+
+#Create vectors of costs over time 
+#AED
+v_C_AED_CPC1 <- c(c_AED_CPC1_Y1, rep(c_annual, each = n_cycles - 1))
+v_C_AED_CPC2 <- c(c_AED_CPC2_Y1, rep(c_annual, each = n_cycles - 1))
+v_C_AED_CPC3 <- c(c_AED_CPC3_Y1, rep(c_annual, each = n_cycles - 1))
+v_C_AED_CPC4 <- c(c_AED_CPC4_Y1, rep(c_annual, each = n_cycles - 1))
+v_C_AED_D    <- c(c_AED_D_Y1,    rep(0,        each = n_cycles - 1))
+
+#No AED
+v_C_noAED_CPC1 <- c(c_noAED_CPC1_Y1, rep(c_annual, each = n_cycles - 1))
+v_C_noAED_CPC2 <- c(c_noAED_CPC2_Y1, rep(c_annual, each = n_cycles - 1))
+v_C_noAED_CPC3 <- c(c_noAED_CPC3_Y1, rep(c_annual, each = n_cycles - 1))
+v_C_noAED_CPC4 <- c(c_noAED_CPC4_Y1, rep(c_annual, each = n_cycles - 1))
+v_C_noAED_D    <- c(c_noAED_D_Y1,    rep(0,        each = n_cycles - 1))
+
+#Costs applied to the AED array
+a_C_AED["CPC1", "CPC1", ] <- v_C_AED_CPC1
+a_C_AED["CPC2", "CPC2", ] <- v_C_AED_CPC2
+a_C_AED["CPC3", "CPC3", ] <- v_C_AED_CPC3
+a_C_AED["CPC4", "CPC4", ] <- v_C_AED_CPC4
+a_C_AED["D",     "D", ]   <- v_C_AED_D
+
+#Costs applied to the no AED array
+a_C_noAED["CPC1", "CPC1", ] <- v_C_noAED_CPC1
+a_C_noAED["CPC2", "CPC2", ] <- v_C_noAED_CPC2
+a_C_noAED["CPC3", "CPC3", ] <- v_C_noAED_CPC3
+a_C_noAED["CPC4", "CPC4", ] <- v_C_noAED_CPC4
+a_C_noAED["D",     "D", ]   <- v_C_noAED_D
+
+# Vectors with utilities by treatment
+#AED
+v_u_AED  <- c(1 - du_CPC1 + u_change, 
+              1 - du_CPC2 + u_change, 
+              1 - du_CPC3 + u_change, 
+              1 - du_CPC4 + u_change, 
+              u_D)
+
+#No AED
+v_u_noAED <- v_u_AED
+
+names(v_u_AED) <- names(v_u_noAED) <- v_names_states
+
+l_c <- list(AED   = a_C_AED, 
+            noAED = a_C_noAED)
+
+l_u <- list(AED   = v_u_AED,
+            noAED = v_u_noAED)
+```
+
+
+
+## 07.4 Calculate total costs and QALYs
+
+```{r}
+# Calculate QALYs 
+#AED
+v_qaly_AED      <- m_M_AED %*% v_u_AED # calculate the QALYs
+v_qaly_AED[1, ] <- v_qaly_AED[2, ] - sum(m_M_AED[2, - n_states] * du_arrest) # Calculate the proportion in each CPC state (all without dead), multiply with the disutility for arrest and subtract that in that cycle
+
+# Apply discount rate and half cycle correction
+v_tot_qaly_AED <- t(v_qaly_AED) %*% (v_dwe * v_wcc)  
+
+# noAED
+v_qaly_noAED      <- m_M_noAED %*% v_u_noAED
+v_qaly_noAED[1, ] <- v_qaly_noAED[2, ] - sum(m_M_noAED[2, - n_states] * du_arrest) # Calculate the proportion in each CPC (all without dead), multiply with the disutility for arrest and subtract that in that cycle
+
+# Apply discount rate and half cycle correction
+v_tot_qaly_noAED  <- t(v_qaly_noAED) %*% (v_dwe * v_wcc) 
+
+# Calculate Costs
+# Create matrix to calculate costs over time
+m_R_AED <- m_R_noAED<-  matrix(0,
+                     nrow = n_cycles+1,
+                     ncol = n_states,
+                     dimnames = list( 0:(n_cycles), v_names_states)) # name the columns and rows of the matrix
+
+for (t in 1:(n_cycles)){
+  m_R_AED[t + 1,   ] <- colSums(a_A_AED[, , t]   * a_C_AED[, , t])
+  m_R_noAED[t + 1, ] <- colSums(a_A_noAED[, , t] * a_C_noAED[, , t])
+  
+}
+
+# Create vector of total costs
+v_costs_AED <- rowSums(m_R_AED)
+v_costs_noAED <- rowSums(m_R_noAED)
+
+# Apply discount rate and half cycle correction
+v_tot_costs_AED   <- t(v_costs_AED)   %*% (v_dwc * v_wcc) 
+v_tot_costs_noAED <- t(v_costs_noAED) %*% (v_dwc * v_wcc) 
+
+# Create vector of total costs and QALYs
+v_tot_cost <- round(c(v_tot_costs_AED, v_tot_costs_noAED))
+v_tot_qaly <- round(c(v_tot_qaly_AED,  v_tot_qaly_noAED), 3)
+
+
+
+```
+
+
+#  08 Compute Cost-effectiveness analysis (CEA) 
+```{r}
+# Calculate incremental cost-effectiveness ratios (ICERs) 
+df_cea <- calculate_icers(cost       = v_tot_cost, 
+                          effect     = v_tot_qaly,
+                          strategies = v_names_str)
+df_cea
+
+#Option to export data
+write.csv(df_cea, file = "./output/base_case_analysis.csv")
+
+
+```
+
+## 08.1 CEA results
+
+```{r}
+# Create CEA table in proper format
+table_cea <- format_table_cea(df_cea)
+table_cea
+```
+
+## 08.2 Plot efficienty frontier
+
+```{r Home-AED-CEA, fig.cap = 'Cost-effectiveness efficient frontier for Home AED model.', message = FALSE, warning = FALSE, fig.pos = "H"}
+plot(df_cea, label = "all", txtsize = 16) +
+     expand_limits(x = max(table_cea$QALYs) + 0.1) +
+     theme(legend.position = c(0.8, 0.2))
+
+# Option to save figure
+ggsave("./figures/efficienty_frontier.pdf")
+```
+
+
+# 09 Sensitivity analysis 
+Note: all the one and two way sensitivity analysis code chunks don't run automatically as eval = FALSE. 
+
+## 09.1 List of input parameters
+Create list `l_param_trt_sa` with all input probabilities, cost and utilities. 
+
+```{r, eval = FALSE}
+l_param_trt_sa <- list()  # initiate the list 
+l_param_trt_sa <- l_param # store the list of parameters in the list 
+```
+
+## 09.2 Create a function of the decision model
+In the one-way sensitivity analyses several parameters will be varied over a range of parameter values, while the remaining parameters will kept constant. For this we first developed a function of the model. This function simulates the cohort and calculate the cost and effect based on the parameters values in the list. This list is the already used list `l_param`. What we are not doing, is we create a dataframe that is contains several parameters of interested that are already in the list, but we give them a range of values. Based on this range the function `run_owsa_det` will run the model several times each time taking an other values within the range of the parameter and estimate the values, while keeping the rest constant. The output is a dataframe with the expected model outcome for each simulation run. 
+
+```{r, eval = FALSE}
+options(scipen = 999) # disabling scientific notation in R
+# dataframe containing all parameters, their base case values, and the min and 
+
+# Test the model function
+calculate_cea_output_private_AED(l_param_trt_sa, n_wtp = wtp, verbose = FALSE)
+
+
+
+```
+
+
+## 09.3 Create one-way sensitivity analyses dataset
+```{r}
+# Create a dataframe with the parameters of interest for the one-way sensitivity analysis (OWSA)
+# Include minimum and maximum values to be tested
+
+# Define parameter names
+v_param_names <- c(
+  # Probability Values
+  "p_cardiac_arrest", "p_AED_used", "p_shockable_noAED", "rr_AED_group_shockable",
+  "p_survive_shockable_noAED", "p_survive_nonshockable_noAED", 
+  "rr_survive_AED_group_shockable", "rr_survive_AED_group_nonshockable",
+  "size_household", "n_cycles",
+  
+  # Cost Values
+  "c_AED", "d_c",
+  
+  # Multiplier Values
+  "p_multiplier", "c_multiplier", "u_change"
+)
+
+# Define minimum values
+v_param_min <- c(
+  # Probability Values
+  0, 0, 0.05, 1, 0.1, 0.02, 1, 0.8, 1, 5,
+  
+  # Cost Values
+  1, 0,
+  
+  # Multiplier Values
+  0.5, 0.25, -0.2
+)
+
+# Define maximum values
+v_param_max <- c(
+  # Probability Values
+  0.02, 1, 0.5, 1.3, 0.3, 0.1, 2, 1.2, 50, 100,
+  
+  # Cost Values
+  300, 0.06,
+  
+  # Multiplier Values
+  2, 2, 0.2
+)
+
+# Create the data frame
+df_params_owsa <- data.frame(
+  pars = v_param_names,
+  min = v_param_min,
+  max = v_param_max
+)
+
+df_params_owsa
+```
+
+
+
+## 09.4 Run one-way sensitivity analyses 
+
+### 09.4.1 OWSA for ICER
+```{r}
+l_param_trt_sa$n_wtp <- wtp
+```
+
+```{r, eval = FALSE}
+
+df_owsa_icer  <- run_owsa_det(params_range = df_params_owsa,    # dataframe with parameters for OWSA
+                          params_basecase  = l_param_trt_sa,    # list with all parameters
+                          nsamp            = 1000,              # number of parameter values
+                          FUN              = calculate_cea_output_private_AED,  # function to compute outputs
+                          outcomes         = c("ICER"),         # output to do the OWSA on
+                          strategies       = v_names_str,       # names of the strategies
+                          n_wtp            = wtp)               # extra argument to pass to FUN
+
+# Save the work
+write.csv(df_owsa_icer, file = "./output/owsa_icer.csv")
+
+
+```
+
+
+### 09.4.1 Plot OWSA
+
+```{r, eval = FALSE}
+# Select treatment of interest to make the plot
+# Plot the sensitivity analysis figures
+plot(df_owsa_icer, txtsize = 10, n_x_ticks = 4, 
+     facet_scales = "free") +
+     theme(legend.position = "bottom")
+
+#Option to save the plot
+#ggsave(path = here("./figures"), filename = paste("OWSA_ICER", "_", n, ".png", sep =""))  
+```
+### 09.4.2 OWSA for NBM
+
+```{r, eval = FALSE}
+df_owsa_nmb  <- run_owsa_det(params_range = df_params_owsa,    # dataframe with parameters for OWSA
+                          params_basecase  = l_param_trt_sa,   # list with all parameters
+                          nsamp            = 1000,              # number of parameter values
+                          FUN              = calculate_cea_output_private_AED,  # function to compute outputs
+                          outcomes         = c("NMB"),         # output to do the OWSA on
+                          strategies       = v_names_str,       # names of the strategies
+                          n_wtp            = wtp)               # extra argument to pass to FUN
+
+# Save the work
+write.csv(df_owsa_nmb, file = "./output/owsa_nmb.csv")
+
+```
+
+```{r, eval = FALSE}
+# Select treatment of interest to make the plot
+# Plot the sensitivity analysis figures
+plot(df_owsa_nmb, txtsize = 10, n_x_ticks = 4, 
+     facet_scales = "free") +
+     theme(legend.position = "bottom")
+
+#Option to save the plot
+#ggsave(path = here("./figures"), filename = paste("OWSA_NBM", "_", n, ".png", sep =""))  
+```
+
+
+## 09.4 General PSA settings
+```{r}
+seed  <- 54321
+set.seed(seed)        # set the seed
+n_iter <- 100000       # number of iterations for the PSA   
+```
+
+### 09.4.1 validate the input data and create a PSA dataset
+```{r}
+# Validate if the datastructure is correct. 
+# Validate_params(param = df_param_clean)
+
+# Make PSA dataframe with the dataframe input we have 
+df_psa_input <- make_psa_df(param = df_param_clean, n_iter = n_iter, seed = seed)
+m_Parameters <- gen_psa(df_psa_input)
+
+# save the PSA data
+filename_m_Parameters <- paste0("./output/m_Parameters_", n_iter, "_seed_", seed, ".rda")
+
+save(m_Parameters, file = filename_m_Parameters) 
+#load("./output/m_Parameters.rda")
+
+```
+
+### 09.4.2 Test if the function works with the dataset
+```{r}
+calculate_cea_output_private_AED(df_psa_input[1, ])
+```
+
+
+### 09.4.3 Create histograms of the PSA parameters
+```{r}
+# Histogram of parameters for a treatment 
+df_psa_input <- m_Parameters
+
+#Set the maximum disutility to 1.36
+df_psa_input$du_CPC1 <- ifelse(df_psa_input$du_CPC1 >= 1.36, 1.36, df_psa_input$du_CPC1)
+df_psa_input$du_CPC2 <- ifelse(df_psa_input$du_CPC2 >= 1.36, 1.36, df_psa_input$du_CPC2)
+df_psa_input$du_CPC3 <- ifelse(df_psa_input$du_CPC3 >= 1.36, 1.36, df_psa_input$du_CPC3)
+save(df_psa_input, file = "./output/df_psa_input.csv") 
+
+# Adjust the numbers of which parameters you like to see here
+length(colnames(df_psa_input))
+df_psa_input_plot_hist <- df_psa_input[, 1:58]
+  
+histogram <- ggplot(melt(df_psa_input_plot_hist, variable.name = "Parameter"), aes(x = value)) +
+       facet_wrap(~Parameter, scales = "free") +
+       geom_histogram(aes(y = ..density..)) +
+       theme_bw(base_size = 16) + 
+       theme(axis.text = element_text(size = 8))
+
+# Extra code to store the PSA histograms if of interest 
+ggsave(path = here("./figures"), filename = paste("PSA_histogram", "_", ".png", sep =""))  # save the plot
+
+
+```
+
+### 09.1.3.1 Interactive plotly image to check the distributions for the PSA
+
+```{r, eval = FALSE}
+# The aim of this section is to give the user the posibility to view the used distributions in the PSA (These images answer the question: how are the sampled values distributed)
+df_melt <- melt(df_psa_input, variable.name = "Parameter")
+
+plot_ly(
+  data = df_melt,
+  x = ~value,
+  type = "histogram"
+) %>%
+  layout(
+    updatemenus = list(
+      list(
+        buttons = lapply(unique(df_melt$Parameter), function(param) {
+          list(
+            method = "restyle",
+            args = list("x", list(df_melt$value[df_melt$Parameter == param])),
+            label = param
+          )
+        }),
+        direction = "down",
+        x = 1.1,
+        y = 1
+      )
+    ),
+    title = "Interactive Histogram by Parameter"
+  )
+```
+
+
+
+
+### 09.4.4 Initial data frames to store the outcome of the PSA
+```{r}
+# Initialize dataframes with PSA output 
+# Dataframe of costs and effectiveness 
+df_c_psa <- df_e_psa  <- as.data.frame(matrix(0,
+                                              nrow = n_iter,
+                                              ncol = n_str))
+
+colnames(df_c_psa) <- colnames(df_e_psa) <- v_names_str
+
+# Matrix for the output of the PSA 
+v_output <- c("QALY", "Costs")            # Vector of output names
+m_output <- matrix(NA, 
+                   ncol = as.numeric(length(v_output)) * as.numeric(n_str), 
+                   nrow = n_iter, 
+                   dimnames = list(paste("Iteration", 1:n_iter, sep = " "), 
+                                   (paste(rep(v_output, n_str), rep(c("AED", "noAED"), 
+                                  each = length(v_output)), sep = " "))))
+
+
+
+```
+
+
+###09.4.5 Run PSA 
+```{r}
+
+t_start_psa <- Sys.time()
+  
+  for(g in 1:n_iter){
+    l_param_psa <- as.list(m_Parameters[g, ]) # select the items for this iteration
+    
+    df_ce_psa <- calculate_cea_output_private_AED(l_param_psa, n_wtp = wtp, verbose = FALSE)
+    
+    # store key parameters
+    df_c_psa[g, ]    <- df_ce_psa$Cost
+    df_e_psa[g, ]    <- df_ce_psa$Effect
+  
+    # Display simulation progress
+    if(g/(n_iter/10) == round(g/(n_iter/10), 0)) { # display progress every 10%
+      cat('\r', paste(g/n_iter * 100, "% PSA of treatment done")) }
+    
+    #Store the treatment specific values 
+    m_output[, "Costs noAED"] <- df_c_psa$noAED
+    m_output[, "Costs AED"]   <- df_c_psa$AED
+  
+    m_output[, "QALY noAED"]  <- df_e_psa$noAED
+    m_output[, "QALY AED"]    <- df_e_psa$AED
+    
+    }
+  
+t_end_psa <-  Sys.time() - t_start_psa
+round(t_end_psa, 2)
+
+```
+
+### 09.4.6 Option to save the PSA data
+
+```{r}
+filename_m_output_psa <- paste0("./output/m_output_n_iter_", n_iter, "_seed_", seed, ".rda")
+
+save(m_output, file = filename_m_output_psa)   
+#load("./output/m_output_100000.rda")
+#load("./output/m_output_n_iter_25000_seed_54321.rda")
+```
+
+### 09.4.5 Test for the stability of the PSA
+After running the PSA we test of the stability of the PSA using the `assertHE` package
+```{r, eval = FALSE}
+source("./tests/test_stability_PSA.R")
+plot_stability_PSA_nmb
+plot_stability_PSA_icer
+```
+
+
+
+
+### 09.4.7 Summary of results
+
+```{r}
+
+### Creae PSA object for dampack
+l_psa <- make_psa_obj(cost          = as.data.frame(m_output[, c("Costs AED", "Costs noAED")]), 
+                      effectiveness = as.data.frame(m_output[, c("QALY AED", "QALY noAED")]), 
+                      parameters    = df_psa_input, 
+                      strategies    = v_names_str)
+
+#Option to export costs and effects from PSA
+write.csv(x = df_c_psa, file = "./output/cost_psa.csv")
+write.csv(x = df_e_psa, file = "./output/effect_psa.csv")
+
+# Create a dataframe that displays the mean cost and mean effect across all of the PSA samples for each strategy
+psa_sum <- summary(l_psa)
+
+```
+
+
+### 09.4.8 Cost Effectiveness Analysis
+
+```{r}
+#Create Vector with willingness-to-pay (WTP) thresholds your considering and would like to have in your plot.
+v_wtp <- seq(0, 5000000, by = 10000)
+```
+
+### 09.4.9 ICER
+
+```{r}
+
+# Calculate the ICER
+calculate_icers(cost       = psa_sum$meanCost,
+                effect     = psa_sum$meanEffect,
+                strategies = psa_sum$Strategy)
+```
+
+### 09.4.10 Cost-Effectiveness Acceptability Curves (CEAC) and Frontier (CEAF)
+
+```{r}
+#Create CEAC and CEAF
+ceac_obj <- ceac(v_wtp, l_psa)
+
+#Option to save the CEAC output
+write.csv(x = ceac_obj, file = "./output/ceac.csv")
+
+#Plot CEAC
+plot(ceac_obj, n_x_ticks = 10) +
+  labs(y = "Probability Cost-Effective")
+
+#Option to save the CEAC graph 
+ggsave(path = here("./figures"), filename = paste("CEAC", "_", ".png", sep =""))  
+
+```
+
+### 09.4.11 Cost-Effectiveness Scatter plot
+
+```{r}
+#Create a cost-effectiveness scatterplot
+plot(l_psa)
+
+# Option to save scatterplot 
+ggsave(path = here("./figures"), filename = paste("scatterplot", "_", ".png", sep ="")) 
+
+```
+
+## 09.5 Expected value of perfect information (EVPI)
+
+```{r}
+#calculate expected value of perfect information from PSA data
+evpi <- calc_evpi(wtp = v_wtp, psa = l_psa)
+# EVPI plot
+plot(evpi, effect_units = "QALY", txtsize = 10, xlim = c(0, 5000))
+ 
+
+# Option to save EVPI 
+ggsave(path = here("./figures"), filename = paste("EVPI", "_", ".png", sep =""))
+#Option to save the CEAC output
+write.csv(x = evpi, file = "./output/evpi.csv")
+
+
+```
+
+
+# Acknowlegdement
+For this research, we made use of the template developed by the Decision Analysis in R for Technologies in Health (DARTH) workgroup: <http://darthworkgroup.com>.
+
+The notation of our code is based on the following provided framework and coding convention:
+Alarid-Escudero, F., Krijkamp, E., Pechlivanoglou, P. et al. A Need for Change! A Coding Framework for Improving Transparency in Decision Modeling. PharmacoEconomics 37, 1329–1339 (2019). <https://doi.org/10.1007/s40273-019-00837-x>.
+
+We used ChatGPT-4 Data Analysis to improve the comments alongside our code with the aim to increase code readability.
+
+
+
+
