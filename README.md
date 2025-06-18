@@ -1,7 +1,5 @@
 # AED_private_homes
-[DRAFT]
-
-This GitHub repository provides the code and related materials for the cost-effectiveness part of the project "Effectiveness and Cost-Effectiveness of Automated External Defibrillators in Private Homes". The corresponding manuscript is currently being finalized and will be submitted to a peer-reviewed journal.   
+This GitHub repository provides the code and related materials for the cost-effectiveness part of the project "Effectiveness and Cost-Effectiveness of Automated External Defibrillators in Private Homes". The corresponding manuscript has been submitted to a peer-reviewed journal.   
 
 For this research, we made use of the template developed by the Decision Analysis in R for Technologies in Health (DARTH) workgroup: <http://darthworkgroup.com>.
 
